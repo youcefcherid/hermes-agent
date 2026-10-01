@@ -570,6 +570,61 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
     return tool_calls
 
 
+# Vendor prefixes whose minted ids some providers reject when an assistant
+# message replays them in a parallel batch (#130363). A single such id is
+# accepted, so only multi-call turns are rewritten; single-call turns stay
+# byte-identical to protect prompt-cache prefixes.
+PROVIDER_MINTED_ID_PREFIXES: tuple[str, ...] = ("chatcmpl-tool-",)
+
+
+def normalize_provider_tool_call_ids(tool_calls: list) -> bool:
+    """Rewrite provider-minted ids that wedge replay of parallel tool batches.
+
+    Some OpenAI-compatible providers mint ids (e.g. ``chatcmpl-tool-<hex>``)
+    that they accept when produced but reject with a 502 when an assistant
+    message replays two or more of them in one turn. Because the ids are
+    persisted verbatim, every later request re-sends the poisoned payload and
+    the session wedges permanently (#130363).
+
+    The rewrite is deterministic (sha256 of the old id, same ``call_<sha12>``
+    scheme as ``deterministic_call_id`` — never uuid4) so re-minting a turn is
+    byte-stable and prompt-cache prefixes don't churn. Composite
+    ``call_id|response_item_id`` halves are preserved. Mutates entries (SDK
+    models / SimpleNamespace / dicts) in place; returns True when any id was
+    rewritten.
+    """
+    calls = list(tool_calls or [])
+    if len(calls) < 2:
+        return False
+    cids = [coalesce_tool_call_id(tc) for tc in calls]
+    if not all(cid and cid.startswith(PROVIDER_MINTED_ID_PREFIXES) for cid in cids):
+        return False
+    rewritten: list[tuple[str, str]] = []
+    for tc, cid in zip(calls, cids):
+        new_id = f"call_{hashlib.sha256(cid.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+        try:
+            # Keep a composite id's response-item half so the provider's fc_/item id survives.
+            old = _tc_field(tc, "id")
+            _tc_set(tc, "id", f"{new_id}|{old.split('|', 1)[1]}" if isinstance(old, str) and "|" in old else new_id)
+            if _tc_field(tc, "call_id"):
+                _tc_set(tc, "call_id", new_id)
+        except Exception:
+            logger.warning("Could not normalize provider-minted tool call id %s", cid)
+            continue
+        rewritten.append((cid, new_id))
+    if rewritten:
+        # One warning per turn naming the cause: a silent rewrite would be
+        # unexplainable in the field.
+        logger.warning(
+            "Rewrote %d provider-minted tool call id(s) to deterministic replacements "
+            "(%s) (#130363): this provider rejects replay of parallel batches carrying its "
+            "own id prefix; the stored row now carries the replacements so later turns "
+            "replay cleanly.", len(rewritten),
+            ", ".join(f"{old} -> {new}" for old, new in rewritten),
+        )
+    return bool(rewritten)
+
+
 # -- reasoning_content policy: single owner of strip-vs-re-pad; adapters keep only SYNTAX --
 # Require side (echo-back enforced; replays 400 without the field): the families below. Kimi
 # is host-driven on purpose (aggregators re-exporting kimi reject it); DeepSeek V4 rejects

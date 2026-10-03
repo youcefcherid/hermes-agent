@@ -1447,7 +1447,12 @@ class SlackAdapter(BasePlatformAdapter):
             if template:
                 return template.format(file_label=file_label)
         message = str(exc)
-        if "Slack returned HTML instead of media" in message or "non-image data" in message:
+        if "non-image data" in message:
+            return (
+                f"Slack attachment access failed for {file_label}: Slack returned "
+                "data that is not a supported image format (expected JPEG, PNG, "
+                "GIF, WebP or BMP). This is not a scope, auth, or file-permission problem.")
+        if "Slack returned HTML instead of media" in message:
             return (
                 f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
                 "This usually means a scope, auth, or file-permission problem.")
@@ -4780,9 +4785,14 @@ class SlackAdapter(BasePlatformAdapter):
     @staticmethod
     def _slack_file_kind(f: Dict[str, Any], mimetype: str) -> str:
         """image / audio / voice clip / video / document, from mimetype (+ voice-clip heuristics)."""
-        for prefix in ("image", "audio"):
-            if mimetype.startswith(prefix + "/"):
-                return prefix
+        if mimetype.startswith("image/"):
+            # cache_image_from_bytes only accepts raster data; SVG/AVIF/… are
+            # XML/unsupported there and would die with a misleading error, so
+            # route non-raster image types as documents (#131738).
+            subtype = mimetype.split("/", 1)[1].split(";", 1)[0].strip().lower()
+            return "image" if subtype in {"jpeg", "jpg", "png", "gif", "webp", "bmp"} else "document"
+        if mimetype.startswith("audio/"):
+            return "audio"
         if mimetype.startswith("video/"):
             return "voice clip" if _is_slack_voice_clip(f) else "video"
         return "document"
@@ -6031,7 +6041,7 @@ class SlackAdapter(BasePlatformAdapter):
                     continue
                 try:
                     cached_path, media_type, _ = await self._cache_slack_file(
-                        "image", f, url, mimetype, team_id)
+                        self._slack_file_kind(f, mimetype), f, url, mimetype, team_id)
                     media_urls.append(cached_path)
                     media_types.append(media_type)
                 except Exception as exc:
